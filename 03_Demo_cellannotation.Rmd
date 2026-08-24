@@ -1,0 +1,140 @@
+---
+title: "Demo: Cell type annotation with Azimuth"
+output: html_document
+date: "2026-08-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Option 1: Mapping to a tissue-specific dataset
+
+There are two ways to use the Azimuth cell type annotation framework. The first (older) option involves using one of the tissue-specific references that are available through Azimuth: https://azimuth.hubmapconsortium.org/references/ 
+
+## Step 1: Download reference dataset
+
+In this example, we will analyze the lung query dataset again using Azimuth. That means we need a lung reference dataset, which we can find on the Azimuth website: https://azimuth.hubmapconsortium.org/references/#Human%20-%20Lung%20v1 (we're using a smaller reference for this example, but note that there is a second reference available from the Human Lung Cell Atlas)
+
+We downloaded the reference data from the Zenodo link: https://zenodo.org/records/4895404 and saved both files (ref.rds and idx.annoy) in a directory.
+
+## Step 2: Load the query dataset
+
+We will analyze a lung sample from HuBMAP. The code below will load and process the data (as in the previous activity) so that we can conduct reference mapping.
+
+```{r}
+library(zellkonverter)
+library(Seurat)
+# Read HBM724.RVJD.893
+query <- readH5AD("../02_demo/lung_query_dataset/expr_HBM724.RVJD.893_lung.h5ad")
+query_seurat <- as.Seurat(query, counts = "X", data = "X")
+```
+
+```{r}
+library(org.Hs.eg.db)
+# Convert assay name to "RNA"
+query_seurat <- RenameAssays(object = query_seurat, originalexp = "RNA")
+
+# Convert feature names from Ensembl to gene symbols
+ensembl_ids <- rownames(query_seurat[["RNA"]])
+ensembl_ids <- gsub("\\..*", "", ensembl_ids)
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = ensembl_ids,
+  keytype = "ENSEMBL",
+  column = "SYMBOL",
+  multiVals = "first"
+)
+gene_symbols[is.na(gene_symbols)] <- ensembl_ids[is.na(gene_symbols)]
+gene_symbols <- make.unique(gene_symbols)
+
+# Add the new gene symbols back to the Seurat object
+counts_mat <- GetAssayData(query_seurat, layer = "counts")
+data_mat   <- GetAssayData(query_seurat, layer = "data")
+rownames(counts_mat) <- gene_symbols
+rownames(data_mat)   <- gene_symbols
+query_seurat[["RNA"]] <- CreateAssayObject(counts = counts_mat)
+query_seurat <- SetAssayData(query_seurat, layer = "data", new.data = data_mat)
+```
+
+We carry out some simple quality control and normalize the gene expression within each cell.
+
+```{r}
+query_seurat$nFeature_RNA <- colSums(query_seurat[["RNA"]]$counts > 0)
+query_seurat$nCount_RNA <- Matrix::colSums(query_seurat[["RNA"]]$counts)
+query_seurat[["percent.mt"]] <- PercentageFeatureSet(query_seurat, pattern = "^MT-")
+head(query_seurat)
+# VlnPlot(query_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+query_seurat <- subset(query_seurat, subset = nFeature_RNA > 200 & percent.mt < 20)
+query_seurat <- NormalizeData(query_seurat)
+```
+
+## Step 3: Use Azimuth to reference map onto the lung reference
+
+Now, we can use the Azimuth reference mapping framework to map the query to the lung reference and annotate query cells based on the reference annotations (more info about this function here: https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html).
+
+```{r}
+library(Azimuth)
+query_azimuth <- Azimuth::RunAzimuth(query_seurat, "azimuth_lung_ref/")
+```
+
+Let's inspect our output. The new Seurat object contains additional metadata columns containing cell type annotations at various levels of resolution:
+
+```{r}
+head(query_azimuth[[]])
+```
+
+We can take a preliminary look at the distribution of cells across predicted cell types.
+
+```{r}
+sort(table(query_azimuth[["predicted.annotation.l2"]]), decreasing = T)
+```
+
+We can also visualize the predicted cell types on a UMAP. One option, is to visualize them on the reference dataset's UMAP:
+
+```{r}
+DimPlot(query_azimuth, reduction = "ref.umap", group.by = "predicted.annotation.l2")
+```
+
+If we want less granularity, we can use the level 1 annotations:
+
+```{r}
+DimPlot(query_azimuth, reduction = "ref.umap", group.by = "predicted.annotation.l1")
+```
+
+We can also build a new UMAP just based on the query cells.
+
+```{r}
+query_azimuth <- FindVariableFeatures(query_azimuth)
+query_azimuth <- ScaleData(query_azimuth)
+query_azimuth <- RunPCA(query_azimuth, features = VariableFeatures(object = query_azimuth))
+query_azimuth <- RunUMAP(query_azimuth, 1:20)
+```
+
+We can color this UMAP by the predicted cell types.
+
+```{r}
+UMAPPlot(query_azimuth, group.by = "predicted.annotation.l1")
+```
+
+# Option 2: Mapping to a pan-human reference dataset
+
+Instead of using a lung-specific dataset, we can use Azimuth's updated cloud interface to map cells from a query dataset to a pan-human reference comprised of cells from more than 20 human tissues (including lung). More information on this here, including code tutorials: https://satijalab.org/pan_human_azimuth/
+
+```{r}
+library(AzimuthAPI)
+query_cloud <- CloudAzimuth(query_seurat)
+```
+
+If we look at the metadata in our output, we'll see many new columns. They contain predicted cell types at different resolutions, along with confidence metrics.
+
+```{r}
+head(query_cloud[[]])
+```
+
+Let's inspect the predicted cell type annotations for this version of the output: 
+
+```{r}
+head(sort(table(query_cloud[["final_level_labels"]]), decreasing = T))
+```
+

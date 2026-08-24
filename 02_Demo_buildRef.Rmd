@@ -1,0 +1,203 @@
+---
+title: "Demo: Building a reference and mapping with Symphony"
+output: html_document
+date: "2026-08-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Step 1: Load reference datasets
+
+We have selected three HuBMAP lung samples to use in our reference. (Note: this is much smaller than a reference should be. We're building a small reference just to illustrate the steps of the process, but for a real reference you'd likely have 20+ samples and 100,000+ cells.)
+
+```{r}
+library(zellkonverter)
+# Read HBM442.GZFZ.522
+ref_1 <- readH5AD("lung_ref_datasets/expr_HBM442.GZFZ.522_lung.h5ad")
+
+# Read HBM668.RQWZ.595
+ref_2 <- readH5AD("lung_ref_datasets/expr_HBM668.RQWZ.595_lung.h5ad")
+
+# Read HBM927.ZWBG.769
+ref_3 <- readH5AD("lung_ref_datasets/expr_HBM927.ZWBG.769_lung.h5ad")
+```
+
+These datasets have been read into R as SingleCellExperiment objects. This is one way to analyze single-cell data, but for this demo, we will use the Seurat framework instead. We'll need to convert the SCE objects into Seurat objects:
+
+```{r}
+library(Seurat)
+ref_1_seurat <- as.Seurat(ref_1, counts = "X", data = "X")
+dim(ref_1_seurat)
+
+ref_2_seurat <- as.Seurat(ref_2, counts = "X", data = "X")
+dim(ref_2_seurat)
+
+ref_3_seurat <- as.Seurat(ref_3, counts = "X", data = "X")
+dim(ref_3_seurat)
+```
+
+To make a single reference, we need to combine these individual datasets into a single seurat object. We'll use the `merge` function from Seurat, which you can read about more here: https://satijalab.org/seurat/articles/essential_commands#merge-objects-without-integration
+
+```{r}
+ref_seurat <- merge(
+  x = ref_1_seurat, 
+  y = c(ref_2_seurat, ref_3_seurat), 
+  add.cell.ids = c("ref1", "ref2", "ref3"), 
+  project = "lung_ref"
+)
+dim(ref_seurat)
+```
+
+To make the data a little easier to work with in Seurat, we can also convert the assay name and feature names:
+
+```{r}
+library(org.Hs.eg.db)
+# Convert assay name to "RNA"
+ref_seurat <- RenameAssays(object = ref_seurat, originalexp = "RNA")
+
+# Convert feature names from Ensembl to gene symbols
+ensembl_ids <- rownames(ref_seurat[["RNA"]])
+ensembl_ids <- gsub("\\..*", "", ensembl_ids)
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = ensembl_ids,
+  keytype = "ENSEMBL",
+  column = "SYMBOL",
+  multiVals = "first"
+)
+gene_symbols[is.na(gene_symbols)] <- ensembl_ids[is.na(gene_symbols)]
+gene_symbols <- make.unique(gene_symbols)
+
+# Add the new gene symbols back to the Seurat object
+counts_mat <- GetAssayData(ref_seurat, layer = "counts")
+data_mat   <- GetAssayData(ref_seurat, layer = "data")
+rownames(counts_mat) <- gene_symbols
+rownames(data_mat)   <- gene_symbols
+ref_seurat[["RNA"]] <- CreateAssayObject(counts = counts_mat)
+ref_seurat <- SetAssayData(ref_seurat, layer = "data", new.data = data_mat)
+```
+
+Now, we can run some basic single-cell processing steps to remove low-quality cells, normalize gene expression, find variable genes, scale the expression of variable genes across cells, and run PCA (see here for the steps: https://satijalab.org/seurat/articles/essential_commands#standard-seurat-workflow - you can customize these as needed for your data). We don't *need* to run these steps before Symphony, but it's a good way to just make sure the data you're using for your reference look reasonable.
+
+```{r}
+# Adding columns for number of features per cell, number of UMIs per cell, and percent MT UMIs per cell - QC metrics
+ref_seurat$nFeature_RNA <- colSums(ref_seurat[["RNA"]]$counts > 0)
+ref_seurat$nCount_RNA <- Matrix::colSums(ref_seurat[["RNA"]]$counts)
+ref_seurat[["percent.mt"]] <- PercentageFeatureSet(ref_seurat, pattern = "^MT-")
+head(ref_seurat)
+VlnPlot(ref_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+ref_seurat <- subset(ref_seurat, subset = nFeature_RNA > 200 & percent.mt < 20)  # removing low quality cells
+ref_seurat <- NormalizeData(object = ref_seurat)  # normalizing expression within each cell (log CP10K)
+ref_seurat <- FindVariableFeatures(object = ref_seurat)  # finding top 2000 variable features using VST
+ref_seurat <- ScaleData(object = ref_seurat)  # scaling each gene's expression across cells
+ref_seurat <- RunPCA(object = ref_seurat, features = VariableFeatures(object = ref_seurat))  # Run PCA for dimensionality reduction
+ref_seurat <- RunUMAP(ref_seurat, dims = 1:20)
+```
+
+Let's inspect our reference. We'll add a column containing the original dataset that each cell came from, and we can color the PCA plot by the original dataset.
+
+```{r}
+ref_seurat$original.dataset <- substring(row.names(ref_seurat[[]]), 1, 4)
+UMAPPlot(ref_seurat, group.by = "original.dataset")
+```
+
+## Step 2: Create Symphony reference
+
+Now, we can create a reference using Symphony. Symphony requires a very specific structure for the reference, so the package provides a helper function to make the reference. You can find more details on how to build a reference for Symphony in its GitHub tutorial: https://github.com/immunogenomics/symphony
+
+```{r}
+library(symphony)
+reference = symphony::buildReference(
+    ref_seurat[["RNA"]]$counts,                   # reference expression (genes by cells)
+    ref_seurat[[]],              # reference metadata (cells x attributes)
+    vars = c('original.dataset'),         # variable(s) to integrate over
+    K = 100,                   # number of Harmony soft clusters
+    verbose = TRUE,            # display verbose output
+    do_umap = TRUE,            # run UMAP and save UMAP model to file
+    do_normalize = FALSE,      # perform log(CP10k) normalization on reference expression
+    vargenes_method = 'vst',   # variable gene selection method: 'vst' or 'mvp'
+    vargenes_groups = 'original.dataset', # metadata column specifying groups for variable gene selection within each group
+    topn = 2000,               # number of variable genes (per group)
+    theta = 2,                 # Harmony parameter(s) for diversity term
+    d = 20,                    # number of dimensions for PCA
+    save_uwot_path = 'lung_ref_datasets/lung_ref_umap.uwot', # file path to save uwot UMAP model
+    additional_genes = NULL    # vector of any additional genes to force include
+)
+
+```
+
+We've successfully created a reference! Now we can try mapping a query onto it.
+
+## Step 3: Load query dataset
+
+We have selected one additional HuBMAP lung sample to use as a query to map onto our reference. Let's read it into R and do all the pre-processing steps.
+
+```{r}
+# Read HBM724.RVJD.893
+query <- readH5AD("lung_query_dataset/expr_HBM724.RVJD.893_lung.h5ad")
+
+# Make Seurat object
+query_seurat <- as.Seurat(query, counts = "X", data = "X")
+dim(query_seurat)
+
+# Convert assay name to "RNA"
+query_seurat <- RenameAssays(object = query_seurat, originalexp = "RNA")
+
+# Convert feature names from Ensembl to gene symbols
+ensembl_ids <- rownames(query_seurat[["RNA"]])
+ensembl_ids <- gsub("\\..*", "", ensembl_ids)
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = ensembl_ids,
+  keytype = "ENSEMBL",
+  column = "SYMBOL",
+  multiVals = "first"
+)
+gene_symbols[is.na(gene_symbols)] <- ensembl_ids[is.na(gene_symbols)]
+gene_symbols <- make.unique(gene_symbols)
+
+# Add the new gene symbols back to the Seurat object
+counts_mat <- GetAssayData(query_seurat, layer = "counts")
+data_mat   <- GetAssayData(query_seurat, layer = "data")
+rownames(counts_mat) <- gene_symbols
+rownames(data_mat)   <- gene_symbols
+query_seurat[["RNA"]] <- CreateAssayObject(counts = counts_mat)
+query_seurat <- SetAssayData(query_seurat, layer = "data", new.data = data_mat)
+
+query_seurat$nFeature_RNA <- colSums(query_seurat[["RNA"]]$counts > 0)
+query_seurat$nCount_RNA <- Matrix::colSums(query_seurat[["RNA"]]$counts)
+query_seurat[["percent.mt"]] <- PercentageFeatureSet(query_seurat, pattern = "^MT-")
+head(query_seurat)
+VlnPlot(query_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+query_seurat <- subset(query_seurat, subset = nFeature_RNA > 200 & percent.mt < 20)  # removing low quality cells
+```
+
+## Step 5: Map query to reference
+
+```{r}
+query = mapQuery(query_seurat[["RNA"]]$counts,             # query gene expression (genes x cells)
+                 query_seurat[[]],        # query metadata (cells x attributes)
+                 reference,             # Symphony reference object
+                 vars = NULL,           # Query batch variables to harmonize over (NULL treats query as one batch)
+                 do_normalize = TRUE,  # perform log(CP10k) normalization on query (set to FALSE if already normalized)
+                 do_umap = TRUE)        # project query cells into reference UMAP
+
+```
+
+We can now visualize our query cells mapped to the reference!
+
+```{r}
+# Combining ref/query labels with UMAP coordinates into one dataframe
+labels_combined = c(rep("ref", ncol(ref_seurat)), rep("query", ncol(query_seurat)))
+umap_combined = data.frame(rbind(reference$umap$embedding, query$umap))
+umap_combined$label = labels_combined
+
+library(ggplot2)
+ggplot(umap_combined, aes(UMAP1, UMAP2, color = label)) +
+  geom_point(shape = ".")
+```
+

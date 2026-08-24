@@ -1,0 +1,129 @@
+---
+title: "Activity: Cell annotation with Azimuth"
+output: html_document
+date: "2026-08-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Option 1: Mapping to a tissue-specific dataset
+
+## Step 1: Download reference dataset
+
+In this example, we will analyze the kidney query dataset again using Azimuth. That means we need a kidney reference dataset, which we can find on the Azimuth website: https://azimuth.hubmapconsortium.org/references/#Human%20-%20Kidney.
+
+Download the reference data from the Zenodo link: https://zenodo.org/records/10694842 Save both files (ref.rds and idx.annoy) in a directory.
+
+## Step 2: Load the query dataset
+
+Load the kidney sample and process the data so that we can conduct reference mapping
+
+```{r}
+library(zellkonverter)
+library(Seurat)
+# Read HBM764.ZCQR.585
+query <- readH5AD("../02_exercise/kidney_query_dataset/expr_HBM764.ZCQR.585_kidney.h5ad")
+query_seurat <- as.Seurat(query, counts = "X", data = "X")
+```
+
+```{r}
+library(org.Hs.eg.db)
+# Convert assay name to "RNA"
+query_seurat <- RenameAssays(object = query_seurat, originalexp = "RNA")
+
+# Convert feature names from Ensembl to gene symbols
+ensembl_ids <- rownames(query_seurat[["RNA"]])
+ensembl_ids <- gsub("\\..*", "", ensembl_ids)
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = ensembl_ids,
+  keytype = "ENSEMBL",
+  column = "SYMBOL",
+  multiVals = "first"
+)
+gene_symbols[is.na(gene_symbols)] <- ensembl_ids[is.na(gene_symbols)]
+gene_symbols <- make.unique(gene_symbols)
+
+# Add the new gene symbols back to the Seurat object
+counts_mat <- GetAssayData(query_seurat, layer = "counts")
+data_mat   <- GetAssayData(query_seurat, layer = "data")
+rownames(counts_mat) <- gene_symbols
+rownames(data_mat)   <- gene_symbols
+query_seurat[["RNA"]] <- CreateAssayObject(counts = counts_mat)
+query_seurat <- SetAssayData(query_seurat, layer = "data", new.data = data_mat)
+```
+
+```{r}
+query_seurat$nFeature_RNA <- colSums(query_seurat[["RNA"]]$counts > 0)
+query_seurat$nCount_RNA <- Matrix::colSums(query_seurat[["RNA"]]$counts)
+query_seurat[["percent.mt"]] <- PercentageFeatureSet(query_seurat, pattern = "^MT-")
+head(query_seurat)
+# VlnPlot(query_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+query_seurat <- subset(query_seurat, subset = nFeature_RNA > 200 & percent.mt < 25)
+dim(query_seurat)
+query_seurat <- NormalizeData(query_seurat)
+```
+
+## Step 3: Use Azimuth to reference map onto the kidney reference
+
+```{r}
+query_azimuth <- Azimuth::RunAzimuth(query_seurat, "azimuth_kidney_ref/")
+```
+
+Let's inspect our output. The new Seurat object contains additional metadata columns containing cell type annotations at various levels of resolution:
+
+```{r}
+head(query_azimuth[[]])
+```
+
+We can take a preliminary look at the distribution of cells across predicted cell types.
+
+```{r}
+head(sort(table(query_azimuth[["predicted.annotation.l1"]]), decreasing = T))
+head(sort(table(query_azimuth[["predicted.annotation.l2"]]), decreasing = T))
+head(sort(table(query_azimuth[["predicted.annotation.l3"]]), decreasing = T))
+```
+
+We can also visualize the predicted cell types on the reference dataset's UMAP:
+
+```{r}
+DimPlot(query_azimuth, reduction = "ref.umap", group.by = "predicted.annotation.l2")
+```
+
+We can also build a new UMAP just based on the query cells.
+
+```{r}
+query_azimuth <- FindVariableFeatures(query_azimuth)
+query_azimuth <- ScaleData(query_azimuth)
+query_azimuth <- RunPCA(query_azimuth, features = VariableFeatures(object = query_azimuth))
+query_azimuth <- RunUMAP(query_azimuth, 1:20)
+```
+
+We can color this UMAP by the predicted cell types.
+
+```{r}
+UMAPPlot(query_azimuth, group.by = "predicted.annotation.l1")
+```
+
+# Option 2: Mapping to a pan-human reference dataset
+
+Instead of using a kidney-specific dataset, we can use Azimuth's cloud interface to map cells from a query dataset to a pan-human reference comprised of cells from more than 20 human tissues (including kidney).
+
+```{r}
+library(AzimuthAPI)
+query_cloud <- CloudAzimuth(query_seurat)
+```
+
+The metadata contains predicted cell types at different resolutions, along with confidence metrics.
+
+```{r}
+head(query_cloud[[]])
+```
+
+Let's inspect the predicted cell type annotations for this version of the output: 
+
+```{r}
+head(sort(table(query_cloud[["final_level_labels"]]), decreasing = T))
+```
